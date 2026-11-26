@@ -1,0 +1,12 @@
+# environment
+.venv/
+__pycache__/
+*.pyc
+
+# created when the app runs
+settings.json
+controller_keyboard.log
+controller_keyboard.log.old
+
+# local only
+disabled-startup/
