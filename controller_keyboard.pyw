@@ -24,6 +24,7 @@ import ctypes
 import json
 import math
 import os
+import queue
 import sys
 import time
 import tkinter as tk
@@ -56,6 +57,10 @@ DEFAULT_CONTROLLER = {
     "stick_x": 0, "stick_y": 1,
     "c_up": "a4-", "c_right": "a3+", "c_down": "a4+", "c_left": "a3-",    # scroll; C-down = Enter
     "dpad_up": "h0:up", "dpad_down": "h0:down", "dpad_left": "h0:left", "dpad_right": "h0:right",
+}
+# Friendlier names for controllers Windows only reports generically (by SDL GUID).
+KNOWN_CONTROLLERS = {
+    "030020b2c82d00001930000000000000": "8BitDo 64 (Bluetooth)",
 }
 HAT_DIRS = {"up": (1, 1), "down": (1, -1), "left": (0, -1), "right": (0, 1)}   # (hat index, sign)
 
@@ -292,9 +297,45 @@ class App:
         self.mouse_wait_center = False
         self.reset_typing()
 
+        self.joy_index = None          # SDL device index of the open controller (for auto-detect)
+        self.last_read = None          # the latest controller state (the settings window shows it live)
+        self.capturing = False         # setup wizard recording inputs: don't act on the controller
+        self.preview_until = 0.0       # show the wheel briefly while its size / opacity is changed
+        self.commands = queue.Queue()  # from the tray icon's thread: run on this one
+        self.listeners = []            # called with no arguments when the mode or connection changes
+
         self.overlay = Overlay(self)
         self.last_settings_check = 0.0
         log("started")
+
+    # ----- for the GUI
+    def notify(self):
+        for fn in list(self.listeners):
+            try:
+                fn()
+            except Exception as e:  # a broken listener mustn't stop the app
+                log(f"listener error: {e!r}")
+
+    def set_mode(self, mode):
+        if mode == self.mode:
+            return
+        self.release_all()
+        self.reset_typing()
+        self.mode = mode
+        self.toast("Desktop mode" if mode == "desktop" else "Controller mode")
+        log(f"mode: {mode}")
+        self.notify()
+
+    def apply_settings(self, settings):
+        """Use new settings (from the settings window) and save them. Raises ValueError on a bad layout."""
+        inputs = parse_controller(settings["controller"])
+        self.settings, self.inputs = settings, inputs
+        self.save_settings()
+
+    def controller_name(self):
+        if self.joy is None:
+            return None
+        return KNOWN_CONTROLLERS.get(self.joy.get_guid(), self.joy.get_name())
 
     # ----- settings
     def load_settings(self):
@@ -362,16 +403,19 @@ class App:
             if ev.type == pygame.JOYDEVICEADDED and self.joy is None:
                 try:
                     self.joy = pygame.joystick.Joystick(ev.device_index)
+                    self.joy_index = ev.device_index
                     log(f"controller connected: {self.joy.get_name()} {self.joy.get_guid()}")
                     self.prev = {}
+                    self.notify()
                 except pygame.error as e:
                     log(f"controller not opened: {e}")
             elif ev.type == pygame.JOYDEVICEREMOVED and self.joy is not None:
                 if ev.instance_id == self.joy.get_instance_id():
                     log("controller disconnected")
-                    self.joy = None
+                    self.joy, self.joy_index, self.last_read = None, None, None
                     self.release_all()
                     self.reset_typing()
+                    self.notify()
 
     def read(self):
         j, inp = self.joy, self.inputs
@@ -393,19 +437,24 @@ class App:
         if now - self.last_settings_check > 1.0:
             self.last_settings_check = now
             self.load_settings()
+        while True:                                   # commands from the tray icon
+            try:
+                cmd = self.commands.get_nowait()
+            except queue.Empty:
+                break
+            cmd()
         self.handle_events()
         if self.joy is not None:
             s = self.read()
+            self.last_read = s
             p = self.prev or {k: (False if isinstance(v, bool) else 0.0) for k, v in s.items()}
             pressed = lambda k: s[k] and not p[k]  # noqa: E731
             released = lambda k: p[k] and not s[k]  # noqa: E731
 
-            if pressed("home"):
-                self.release_all()
-                self.reset_typing()
-                self.mode = "desktop" if self.mode == "controller" else "controller"
-                self.toast("Desktop mode" if self.mode == "desktop" else "Controller mode")
-                log(f"mode: {self.mode}")
+            if self.capturing:
+                pass                                  # the setup wizard is reading the controller
+            elif pressed("home"):
+                self.set_mode("desktop" if self.mode == "controller" else "controller")
             elif self.mode == "desktop":
                 self.desktop(s, p, pressed, released, now)
             self.prev = s
@@ -577,8 +626,11 @@ class App:
         if not active and self.layer and self.show_press and now < self.show_press[1]:
             # B or A with the stick centered: briefly highlight backspace / space on the wheel
             active, center = True, LISTS[self.layer].index(self.show_press[0])
+        layer = self.layer if typing_visible else None
+        if layer is None and now < self.preview_until:   # wheel size / opacity being changed
+            layer, active, center = "letters", False, home_index(LISTS["letters"])
         return {
-            "layer": self.layer if typing_visible else None,
+            "layer": layer,
             "active": active,
             "center": center,
             "upper": self.shift_once != self.caps,
@@ -640,6 +692,7 @@ gdi32.CreateDIBSection.argtypes = [wintypes.HDC, ctypes.POINTER(BITMAPINFO), win
                                    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
 gdi32.SelectObject.restype = wintypes.HGDIOBJ
 gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
 
 FONT_PATH = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "segoeuib.ttf")
 COLORS = {
@@ -666,49 +719,20 @@ class Overlay:
         self.app = app
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title("Controller Keyboard")
+        self.root.title("Controller Keyboard overlay")
         self.root.overrideredirect(True)
 
-        dpi_scale = self.root.winfo_fpixels("1i") / 96.0
-        self.k = k = dpi_scale * float(app.settings.get("overlay_scale", 1.0))
-        self.R = 230 * k                       # radius of the arc the characters ride on
-        self.band = 46 * k                     # thickness of the arc
-        self.top = 34 * k                      # from the window top to the arc's center line at the top
-        self.w = int(2 * (self.R + self.band) * math.sin(math.radians(ARC_FADE_DEG)) + 40 * k)
-        self.h = int(self.R * (1 - math.cos(math.radians(ARC_FADE_DEG))) + self.top + self.band + 40 * k)
-        work = wintypes.RECT()
-        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA
-        self.x = work.left + (work.right - work.left - self.w) // 2
-        self.y = work.bottom - self.h - int(24 * k)
-        self.root.geometry(f"{self.w}x{self.h}+{self.x}+{self.y}")
+        self.dpi_scale = self.root.winfo_fpixels("1i") / 96.0
+        self.screen_dc = user32.GetDC(None)
+        self.mem_dc = gdi32.CreateCompatibleDC(self.screen_dc)
+        self.hbmp = None
+        self.setup_size(float(app.settings.get("overlay_scale", 1.0)))
 
         self.root.update_idletasks()
         self.hwnd = user32.GetAncestor(self.root.winfo_id(), 2)  # GA_ROOT
         ex = user32.GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)
         user32.SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE,
                                  ex | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE)
-
-        # a 32-bit bitmap the frames are copied into, then handed to the window
-        self.screen_dc = user32.GetDC(None)
-        self.mem_dc = gdi32.CreateCompatibleDC(self.screen_dc)
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight = self.w, -self.h   # top-down
-        bmi.bmiHeader.biPlanes, bmi.bmiHeader.biBitCount = 1, 32
-        self.bits = ctypes.c_void_p()
-        self.hbmp = gdi32.CreateDIBSection(self.mem_dc, ctypes.byref(bmi), 0, ctypes.byref(self.bits), None, 0)
-        gdi32.SelectObject(self.mem_dc, self.hbmp)
-        self.fonts = {}
-        self.bases = {}
-        # load every font size and draw the arc now, so the first animation isn't slow
-        for size in range(int(8 * k), int(32 * k) + 2):
-            try:
-                self.fonts[size] = ImageFont.truetype(FONT_PATH, size)
-            except OSError:
-                break
-        self.base(True)
-        self.base(False)
-        self.blank = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
 
         fg = user32.GetForegroundWindow()
         self.push(self.blank)
@@ -724,6 +748,45 @@ class Overlay:
         self.pos = 0.0          # where the characters are drawn (animates toward the selected index)
         self.anim = None        # (start pos, distance, start time, duration) while sliding or spinning
         self.last_tick = time.monotonic()
+
+    def setup_size(self, scale):
+        """Size and place the wheel for a scale (the overlay_scale setting); can be called again to resize."""
+        self.scale = scale
+        self.k = k = self.dpi_scale * scale
+        self.R = 230 * k                       # radius of the arc the characters ride on
+        self.band = 46 * k                     # thickness of the arc
+        self.top = 34 * k                      # from the window top to the arc's center line at the top
+        self.w = int(2 * (self.R + self.band) * math.sin(math.radians(ARC_FADE_DEG)) + 40 * k)
+        self.h = int(self.R * (1 - math.cos(math.radians(ARC_FADE_DEG))) + self.top + self.band + 40 * k)
+        work = wintypes.RECT()
+        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA
+        self.x = work.left + (work.right - work.left - self.w) // 2
+        self.y = work.bottom - self.h - int(24 * k)
+        self.root.geometry(f"{self.w}x{self.h}+{self.x}+{self.y}")
+
+        # a 32-bit bitmap the frames are copied into, then handed to the window
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight = self.w, -self.h   # top-down
+        bmi.bmiHeader.biPlanes, bmi.bmiHeader.biBitCount = 1, 32
+        bits = ctypes.c_void_p()
+        hbmp = gdi32.CreateDIBSection(self.mem_dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+        gdi32.SelectObject(self.mem_dc, hbmp)
+        if self.hbmp:
+            gdi32.DeleteObject(self.hbmp)
+        self.hbmp, self.bits = hbmp, bits
+
+        # load every font size and draw the arc now, so the first animation isn't slow
+        self.fonts, self.bases = {}, {}
+        for size in range(int(8 * k), int(32 * k) + 2):
+            try:
+                self.fonts[size] = ImageFont.truetype(FONT_PATH, size)
+            except OSError:
+                break
+        self.base(True)
+        self.base(False)
+        self.blank = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
+        self.last_state = None                 # redraw at the new size
 
     # ----- drawing helpers
     def font(self, px):
@@ -802,6 +865,12 @@ class Overlay:
 
     # ----- per tick
     def render(self, now):
+        scale = min(3.0, max(0.4, float(self.app.settings.get("overlay_scale", 1.0))))
+        if abs(scale - self.scale) > 1e-6:
+            self.setup_size(scale)
+        opacity = self.app.settings.get("overlay_opacity", 0.9)
+        if opacity != getattr(self, "opacity", None):
+            self.opacity, self.last_state = opacity, None      # push the next frame at the new opacity
         st = self.app.overlay_state(now)
         dt, self.last_tick = now - self.last_tick, now
         prev = self.last_state
@@ -902,29 +971,52 @@ class Overlay:
 
 
 # ---------------------------------------------------------------- entry
+kernel32.CreateMutexW.restype = wintypes.HANDLE
+kernel32.CreateEventW.restype = wintypes.HANDLE
+kernel32.OpenEventW.restype = wintypes.HANDLE
+kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+EVENT_MODIFY_STATE = 0x0002
+OPEN_SETTINGS_EVENT = "Local\\ControllerKeyboardOpenSettings"
+
+
 def main():
     mutex = kernel32.CreateMutexW(None, False, "Local\\ControllerKeyboard8BitDo")
-    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS: already running, so open its settings
+        ev = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, OPEN_SETTINGS_EVENT)
+        if ev:
+            kernel32.SetEvent(ev)
         return
+    open_settings_event = kernel32.CreateEventW(None, False, False, OPEN_SETTINGS_EVENT)  # auto-reset
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except (AttributeError, OSError):
         pass
+    first_run = not os.path.exists(SETTINGS_PATH)
     app = App()
+
+    import gui  # noqa: E402  (next to this file)
+    ui = gui.Gui(app)
+    if first_run or "--settings" in sys.argv:
+        ui.open_settings("controller" if "controller" in sys.argv else None)
 
     def loop():
         try:
+            if open_settings_event and kernel32.WaitForSingleObject(open_settings_event, 0) == 0:
+                ui.open_settings()                 # the app was started again
             app.tick()
         except Exception as e:  # keep running; log what went wrong
             log(f"error: {e!r}")
             app.release_all()
-        app.overlay.root.after(8, loop)
+        if not ui.quitting:
+            app.overlay.root.after(8, loop)
 
     app.overlay.root.after(8, loop)
     try:
         app.overlay.root.mainloop()
     finally:
         app.release_all()
+        ui.stop()
         log("stopped")
         del mutex
 
