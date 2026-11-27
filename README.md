@@ -20,7 +20,7 @@ It's built for the **8BitDo 64** (the N64-style Bluetooth controller), and other
 
 - Windows 10 or 11
 - Python 3.10 or newer
-- A controller that Windows sees as a game controller. The default layout is the 8BitDo 64 in its 8BitDo Bluetooth mode. Other controllers need a quick mapping (see [Other controllers](#other-controllers)).
+- A controller that Windows sees as a game controller. The 8BitDo 64 works out of the box in both its 8BitDo Bluetooth mode and its Switch mode; the app picks the right layout for whichever connects. Other controllers need a quick mapping (see [Other controllers](#other-controllers)).
 
 ## Install and run
 
@@ -49,12 +49,12 @@ The tray icon is **blue** in desktop mode, **gray** in controller mode, and an *
 
 The settings window has two tabs:
 
-- **General:** sliders for mouse speed and precision, the joystick thresholds, step sensitivity, scroll speed, and the wheel's size and opacity. Changes apply right away, and moving a wheel slider shows the wheel.
+- **General:** sliders for mouse speed and precision, the joystick thresholds, step sensitivity, scroll speed, and the wheel's size and opacity, plus two checkboxes: **Invert wheel directions** and **Show the wheel next to the mouse pointer**. Changes apply right away, and moving a wheel slider shows the wheel.
 - **Controller:** every control with the input it uses. A control lights up in the list when you press it, which makes it easy to spot one that's wrong.
   - **Set up all…** walks through every control: press each one when asked.
   - **Change selected…** redoes just one control.
   - **Auto-detect** fills in the layout for controllers that SDL's controller database knows, such as Xbox and PlayStation pads.
-  - **Reset to 8BitDo 64** puts back the defaults.
+  - **Reset to default** puts back the defaults for the connected controller.
 
 `controller_keyboard.pyw --settings controller` opens the settings window on the Controller tab.
 
@@ -80,16 +80,20 @@ The button names are the 8BitDo 64's.
 
 | Control | Does |
 |---|---|
-| Tilt the joystick, then turn it | Step through the wheel, one character per eighth of a turn (clockwise = forward) |
+| Tilt the joystick, then turn it | Step through the wheel, one character per eighth of a turn |
 | A, while tilted | Type the highlighted character (on ⌫, delete; hold to repeat) |
 | A, with the joystick centered | Space |
 | B | Backspace (hold to repeat) |
-| Press the joystick in | Next wheel: letters → numbers → symbols |
+| C-right / C-left | Next / previous wheel: letters ↔ numbers ↔ symbols, with the wheels sliding sideways |
+| C-up or Start | Shift for the next letter. Double press for Caps Lock; a single or double press turns Caps Lock off |
 | C-down | Enter |
-| Start | Shift for the next letter. Double press for Caps Lock; any press turns Caps Lock off |
 | D-pad | Arrow keys |
 
 The wheel rests on the space. Clockwise from there is `a b c …`, and counterclockwise is backspace, then `z y x …`. Letting go of the joystick spins it back to the space. Each new Z press starts on the letters wheel.
+
+**Inverted** (the default): turning the joystick clockwise steps forward, so the wheel turns the other way under the highlight, and C-right slides the next wheel in from the right. **Normal**: the wheel turns the same way as the joystick, and C-right slides the current wheel off to the right.
+
+**Next to the mouse pointer** (off by default): the wheel opens beside the pointer instead of at the bottom of the screen. Away from the screen's edges its top arc shows above the pointer. Near an edge or a corner it shows the part of the wheel facing away from it: near the top edge its bottom, near the bottom-left corner its top-right, and so on.
 
 ## Settings
 
@@ -106,7 +110,10 @@ The settings window covers everything below. Behind it, `settings.json` is creat
 | `scroll_repeat_per_sec` | 12 | Scroll speed while a C button is held |
 | `overlay_scale` | 1.0 | Size of the wheel |
 | `overlay_opacity` | 0.9 | Opacity of the wheel |
+| `invert_wheel` | true | Joystick turns and C-left / C-right move the wheel the opposite way |
+| `wheel_follows_mouse` | false | Show the wheel next to the mouse pointer |
 | `controller` | 8BitDo 64 | Which button, axis or D-pad direction each control is |
+| `layouts` | (none) | Layouts for particular controllers by `"vendor:product"`, such as `"057e:2019"` for the 8BitDo 64 in Switch mode (built in) |
 
 ## Other controllers
 

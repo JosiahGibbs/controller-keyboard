@@ -32,13 +32,12 @@ CONTROLS = [
     ("z", "Z", "Hold to type; tap = right click", ""),
     ("start", "Start", "Windows key; Shift while typing", ""),
     ("home", "Home", "Switch controller / desktop mode", ""),
-    ("stick_click", "Joystick press", "Next wheel while typing", ""),
     ("l", "L", "Browser Back", ""),
     ("r", "R", "Browser Forward", ""),
-    ("c_up", "C-up", "Scroll up", ""),
+    ("c_up", "C-up", "Scroll up; Shift / Caps Lock while typing", ""),
     ("c_down", "C-down", "Scroll down; Enter while typing", ""),
-    ("c_left", "C-left", "Scroll left", ""),
-    ("c_right", "C-right", "Scroll right", ""),
+    ("c_left", "C-left", "Scroll left; previous wheel while typing", ""),
+    ("c_right", "C-right", "Scroll right; next wheel while typing", ""),
     ("dpad_up", "D-pad up", "Arrow key", ""),
     ("dpad_down", "D-pad down", "Arrow key", ""),
     ("dpad_left", "D-pad left", "Arrow key", ""),
@@ -53,7 +52,6 @@ PROMPTS = {
     "c_right": "Press C-right (or push the right stick right)",
     "z": "Press Z (or the trigger you want to hold for typing)",
     "home": "Press Home (the button that switches modes)",
-    "stick_click": "Press the joystick in, like a button",
 }
 
 # Settings sliders: (key, label, low, high, decimals, unit, needs a wheel preview)
@@ -311,6 +309,15 @@ class SettingsWindow:
             self.slider_vars[key], self.value_labels[key] = var, val
             self.show_value(key)
         row = len(SLIDERS)
+        self.invert_var = tk.BooleanVar(value=bool(self.app.settings.get("invert_wheel", True)))
+        ttk.Checkbutton(f, text="Invert wheel directions (turning the joystick and C-left / C-right move the "
+                                "wheel the opposite way)", variable=self.invert_var,
+                        command=self.invert_clicked).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        row += 1
+        self.follow_var = tk.BooleanVar(value=bool(self.app.settings.get("wheel_follows_mouse", False)))
+        ttk.Checkbutton(f, text="Show the wheel next to the mouse pointer", variable=self.follow_var,
+                        command=self.follow_clicked).grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        row += 1
         ttk.Separator(f).grid(row=row, column=0, columnspan=3, sticky="ew", pady=12)
         self.startup_var = tk.BooleanVar(value=startup_enabled())
         ttk.Checkbutton(f, text="Start Controller Keyboard when I sign in", variable=self.startup_var,
@@ -361,7 +368,19 @@ class SettingsWindow:
             self.app.settings[key] = self.ck.DEFAULT_SETTINGS[key]
             self.slider_vars[key].set(float(self.ck.DEFAULT_SETTINGS[key]))
             self.show_value(key)
+        self.app.settings["invert_wheel"] = self.ck.DEFAULT_SETTINGS["invert_wheel"]
+        self.invert_var.set(self.ck.DEFAULT_SETTINGS["invert_wheel"])
+        self.app.settings["wheel_follows_mouse"] = self.ck.DEFAULT_SETTINGS["wheel_follows_mouse"]
+        self.follow_var.set(self.ck.DEFAULT_SETTINGS["wheel_follows_mouse"])
         self.app.preview_until = time.monotonic() + 1.5
+        self.schedule_save()
+
+    def follow_clicked(self):
+        self.app.settings["wheel_follows_mouse"] = bool(self.follow_var.get())
+        self.schedule_save()
+
+    def invert_clicked(self):
+        self.app.settings["invert_wheel"] = bool(self.invert_var.get())
         self.schedule_save()
 
     def startup_clicked(self):
@@ -403,7 +422,7 @@ class SettingsWindow:
         ttk.Button(self.buttons, text="Change selected…", command=self.change_selected).pack(side="left", padx=6)
         self.detect_btn = ttk.Button(self.buttons, text="Auto-detect", command=self.auto_detect)
         self.detect_btn.pack(side="left")
-        ttk.Button(self.buttons, text="Reset to 8BitDo 64", command=self.reset_layout).pack(side="right")
+        ttk.Button(self.buttons, text="Reset to default", command=self.reset_layout).pack(side="right")
 
         # the wizard's panel replaces the table while it runs
         self.wiz_frame = ttk.Frame(f, padding=(0, 20))
@@ -422,7 +441,7 @@ class SettingsWindow:
 
     def fill_table(self):
         self.tree.delete(*self.tree.get_children())
-        layout = self.app.settings["controller"]
+        layout = self.app.current_layout()
         for key, name, does, kind in CONTROLS:
             self.tree.insert("", "end", iid=key, values=(name, does, describe(layout.get(key), kind == "stick"), ""))
 
@@ -457,8 +476,7 @@ class SettingsWindow:
                 self.tree.item(key, tags=("on",) if mark else ())
 
     def save_layout(self, layout):
-        settings = dict(self.app.settings)
-        settings["controller"] = dict(layout)
+        settings = self.app.settings_with_layout(layout)
         try:
             self.app.apply_settings(settings)
         except ValueError as e:
@@ -468,11 +486,11 @@ class SettingsWindow:
         return True
 
     def reset_layout(self):
-        if messagebox.askyesno("Controller Keyboard", "Use the 8BitDo 64 layout for every control?", parent=self.top):
-            self.save_layout(self.ck.DEFAULT_CONTROLLER)
+        if messagebox.askyesno("Controller Keyboard", "Put back the default layout for every control?", parent=self.top):
+            self.save_layout(self.app.default_layout())
 
     def auto_detect(self):
-        layout, message = detect_layout(self.app, dict(self.app.settings["controller"]))
+        layout, message = detect_layout(self.app, self.app.current_layout())
         if layout is None:
             messagebox.showinfo("Controller Keyboard", message, parent=self.top)
             return
@@ -503,7 +521,7 @@ class Wizard:
     def __init__(self, window, keys):
         self.w, self.app, self.ck = window, window.app, window.ck
         self.steps = [c for c in CONTROLS if keys is None or c[0] in keys]
-        self.layout = dict(self.app.settings["controller"])
+        self.layout = self.app.current_layout()
         self.i = 0
         self.wait_release = True       # start once everything is at rest
         self.app.release_all()
@@ -607,7 +625,7 @@ class Wizard:
 # ---------------------------------------------------------------- auto-detect
 SDL_TO_LAYOUT = {
     "a": "a", "b": "b", "lefttrigger": "z", "leftshoulder": "l", "rightshoulder": "r", "start": "start",
-    "guide": "home", "leftstick": "stick_click",
+    "guide": "home",
     "dpup": "dpad_up", "dpdown": "dpad_down", "dpleft": "dpad_left", "dpright": "dpad_right",
 }
 HAT_BITS = {1: "up", 2: "right", 4: "down", 8: "left"}

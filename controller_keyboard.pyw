@@ -53,15 +53,57 @@ DEFAULT_CONTROLLER = {
     "z": 8,                                        # hold to type; tap = right click
     "start": 11,
     "home": 12,                                    # switches controller / desktop mode
-    "stick_click": 13,                             # while typing: letters -> numbers -> symbols
     "stick_x": 0, "stick_y": 1,
-    "c_up": "a4-", "c_right": "a3+", "c_down": "a4+", "c_left": "a3-",    # scroll; C-down = Enter
+    # scroll; while typing C-up = Shift (double press: Caps Lock), C-left / C-right = previous / next
+    # wheel, C-down = Enter
+    "c_up": "a4-", "c_right": "a3+", "c_down": "a4+", "c_left": "a3-",
     "dpad_up": "h0:up", "dpad_down": "h0:down", "dpad_left": "h0:left", "dpad_right": "h0:right",
 }
-# Friendlier names for controllers Windows only reports generically (by SDL GUID).
-KNOWN_CONTROLLERS = {
-    "030020b2c82d00001930000000000000": "8BitDo 64 (Bluetooth)",
+# The 8BitDo 64 with its toggle on Switch: it poses as Nintendo's Switch Online N64 controller
+# (057E:2019).
+SWITCH_N64_CONTROLLER = {
+    "a": 0, "b": 1,
+    "l": 9, "r": 10,
+    "z": "a4+",
+    "start": 6,
+    "home": 5,
+    "stick_x": 0, "stick_y": 1,
+    "c_up": 3, "c_right": 4, "c_down": "a5+", "c_left": 2,
+    "dpad_up": 11, "dpad_down": 12, "dpad_left": 13, "dpad_right": 14,
 }
+# Layouts chosen by the connected controller's USB vendor:product. Anything else uses the
+# "controller" section of settings.json; "layouts" in settings.json overrides these per controller.
+BUILTIN_LAYOUTS = {
+    "057e:2019": SWITCH_N64_CONTROLLER,
+}
+# Friendlier names for controllers Windows only reports generically (by vendor:product).
+KNOWN_CONTROLLERS = {
+    "2dc8:3019": "8BitDo 64 (Bluetooth)",
+    "057e:2019": "8BitDo 64 (Switch mode)",
+}
+
+
+def controller_id(guid):
+    """'vvvv:pppp' from an SDL joystick GUID (vendor and product are little-endian at bytes 4 and 8)."""
+    try:
+        b = bytes.fromhex(guid)
+        return f"{b[5]:02x}{b[4]:02x}:{b[9]:02x}{b[8]:02x}"
+    except (ValueError, IndexError, TypeError):
+        return None
+
+
+def layout_key(settings, cid):
+    """Where this controller's layout lives: a "layouts" entry, or None for the "controller" section."""
+    if cid and (cid in settings.get("layouts", {}) or cid in BUILTIN_LAYOUTS):
+        return cid
+    return None
+
+
+def layout_for(settings, cid):
+    key = layout_key(settings, cid)
+    if key is None:
+        return settings["controller"]
+    return settings.get("layouts", {}).get(key) or BUILTIN_LAYOUTS[key]
 HAT_DIRS = {"up": (1, 1), "down": (1, -1), "left": (0, -1), "right": (0, 1)}   # (hat index, sign)
 
 # ---------------------------------------------------------------- typing lists
@@ -93,7 +135,13 @@ DEFAULT_SETTINGS = {
     "scroll_repeat_per_sec": 12,
     "overlay_scale": 1.0,
     "overlay_opacity": 0.9,
+    # True: turning the joystick clockwise steps forward, so the wheel turns counterclockwise under the
+    # highlight, and C-right slides the next wheel in from the right. False: the wheel turns the way
+    # the joystick does, and C-right slides the wheel off to the right.
+    "invert_wheel": True,
+    "wheel_follows_mouse": False,   # show the wheel next to the mouse pointer instead of at the bottom
     "controller": DEFAULT_CONTROLLER,
+    "layouts": {},                  # per-controller layouts by "vendor:product" (see BUILTIN_LAYOUTS)
 }
 
 
@@ -328,14 +376,42 @@ class App:
 
     def apply_settings(self, settings):
         """Use new settings (from the settings window) and save them. Raises ValueError on a bad layout."""
-        inputs = parse_controller(settings["controller"])
+        inputs = parse_controller(layout_for(settings, self.controller_id()))
         self.settings, self.inputs = settings, inputs
         self.save_settings()
+
+    def controller_id(self):
+        joy = getattr(self, "joy", None)            # load_settings runs before the joystick is set up
+        return controller_id(joy.get_guid()) if joy is not None else None
 
     def controller_name(self):
         if self.joy is None:
             return None
-        return KNOWN_CONTROLLERS.get(self.joy.get_guid(), self.joy.get_name())
+        return KNOWN_CONTROLLERS.get(self.controller_id(), self.joy.get_name())
+
+    def current_layout(self):
+        """The layout in use for the connected controller."""
+        return dict(layout_for(self.settings, self.controller_id()))
+
+    def default_layout(self):
+        return dict(BUILTIN_LAYOUTS.get(self.controller_id(), DEFAULT_CONTROLLER))
+
+    def settings_with_layout(self, layout):
+        """A copy of the settings with the connected controller's layout replaced."""
+        settings = dict(self.settings)
+        key = layout_key(settings, self.controller_id())
+        if key is None:
+            settings["controller"] = dict(layout)
+        else:
+            settings["layouts"] = {**settings.get("layouts", {}), key: dict(layout)}
+        return settings
+
+    def use_layout(self):
+        """Pick the layout for the controller now connected (or the default one)."""
+        try:
+            self.inputs = parse_controller(layout_for(self.settings, self.controller_id()))
+        except ValueError as e:
+            log(f"layout not used: {e}")
 
     # ----- settings
     def load_settings(self):
@@ -354,7 +430,15 @@ class App:
             controller = data.get("controller") if isinstance(data.get("controller"), dict) else {}
             settings["controller"] = {**DEFAULT_CONTROLLER,
                                       **{k: v for k, v in controller.items() if k in DEFAULT_CONTROLLER}}
-            inputs = parse_controller(settings["controller"])    # raises on a bad entry: keep the old ones
+            layouts = data.get("layouts") if isinstance(data.get("layouts"), dict) else {}
+            settings["layouts"] = {}
+            for cid, layout in layouts.items():
+                if isinstance(layout, dict):
+                    base = BUILTIN_LAYOUTS.get(cid.lower(), DEFAULT_CONTROLLER)
+                    settings["layouts"][cid.lower()] = {**base, **{k: v for k, v in layout.items() if k in base}}
+            for layout in [settings["controller"], *settings["layouts"].values()]:
+                parse_controller(layout)                         # raises on a bad entry: keep the old ones
+            inputs = parse_controller(layout_for(settings, self.controller_id()))
             self.settings, self.inputs = settings, inputs
         except (OSError, ValueError) as e:
             log(f"settings.json not read: {e}")
@@ -378,7 +462,8 @@ class App:
         self.dir = None            # joystick direction (0-7) the selection last stepped at
         self.a_back = False        # A held on the backspace slot (repeats like B)
         self.show_press = None     # (character, until): B / A pressed with the stick centered
-        self.typing_layer = "letters"   # cycled with the joystick button while typing
+        self.typing_layer = "letters"   # stepped with C-left / C-right while typing
+        self.layer_dir = 0              # which way the last step went (-1 left, +1 right): the wheel slides that way
         self.shift_once = False
         self.caps = False
         self.last_start_tap = 0.0
@@ -404,7 +489,10 @@ class App:
                 try:
                     self.joy = pygame.joystick.Joystick(ev.device_index)
                     self.joy_index = ev.device_index
-                    log(f"controller connected: {self.joy.get_name()} {self.joy.get_guid()}")
+                    self.use_layout()
+                    log(f"controller connected: {self.joy.get_name()} {self.joy.get_guid()}"
+                        + (f" (layout {layout_key(self.settings, self.controller_id())})"
+                           if layout_key(self.settings, self.controller_id()) else ""))
                     self.prev = {}
                     self.notify()
                 except pygame.error as e:
@@ -413,6 +501,7 @@ class App:
                 if ev.instance_id == self.joy.get_instance_id():
                     log("controller disconnected")
                     self.joy, self.joy_index, self.last_read = None, None, None
+                    self.use_layout()
                     self.release_all()
                     self.reset_typing()
                     self.notify()
@@ -424,7 +513,6 @@ class App:
         return {
             "a": pressed("a"), "b": pressed("b"), "l": pressed("l"), "r": pressed("r"),
             "zl": pressed("z"), "start": pressed("start"), "home": pressed("home"),
-            "stick": pressed("stick_click"),
             "x": axis("stick_x"), "y": axis("stick_y"),
             "c0": pressed("c_up"), "c1": pressed("c_right"), "c2": pressed("c_down"), "c3": pressed("c_left"),
             "up": pressed("dpad_up"), "down": pressed("dpad_down"),
@@ -461,14 +549,17 @@ class App:
         self.overlay.render(now)
 
     def desktop(self, s, p, pressed, released, now):
-        # Left Z held = typing. Each new hold starts on letters; the joystick button cycles
-        # letters -> numbers -> symbols.
+        # Left Z held = typing. Each new hold starts on letters; C-left / C-right step through
+        # letters <-> numbers <-> symbols (wrapping round).
         if pressed("zl"):
             self.zl_down_at, self.zl_used = now, False
-            self.typing_layer = "letters"
-        if s["zl"] and pressed("stick"):
-            self.typing_layer = LAYER_ORDER[(LAYER_ORDER.index(self.typing_layer) + 1) % len(LAYER_ORDER)]
-            self.zl_used = True
+            self.typing_layer, self.layer_dir = "letters", 0
+        if s["zl"]:
+            step = (1 if pressed("c1") else 0) - (1 if pressed("c3") else 0)
+            if step:
+                i = (LAYER_ORDER.index(self.typing_layer) + step) % len(LAYER_ORDER)
+                self.typing_layer, self.layer_dir = LAYER_ORDER[i], step
+                self.zl_used = True
         layer = self.typing_layer if s["zl"] else None
 
         # Left Z: a quick tap with nothing else pressed is a right click.
@@ -574,7 +665,9 @@ class App:
             new_dir = direction_of(x, y, self.dir, st["step_deadband_degrees"])
             if new_dir != self.dir:
                 step = (new_dir - self.dir + 4) % 8 - 4          # -4..3, shortest way round
-                self.sel = (self.sel + step) % len(chars)        # clockwise = forward
+                if not st.get("invert_wheel", True):
+                    step = -step                                 # the wheel turns with the joystick
+                self.sel = (self.sel + step) % len(chars)        # inverted: clockwise = forward
                 self.dir = new_dir
 
         # A types the highlighted character (or a space with the stick centered);
@@ -603,19 +696,24 @@ class App:
             key_tap(VK_RETURN)
             self.flash_char, self.flash_until = "⏎", now + 0.5
         self.arrows(s, now)
-        if pressed("start"):
-            if self.caps:                                # Caps on: a single or double press turns it off
-                self.caps, self.shift_once = False, False
-                self.caps_off_at = now
-                self.last_start_tap = 0.0
-            elif now - self.caps_off_at < 0.40:          # second press of a double press: stay off
-                self.caps_off_at = 0.0
-            elif now - self.last_start_tap < 0.40:       # double tap: Caps Lock
-                self.caps, self.shift_once = True, False
-                self.last_start_tap = 0.0
-            else:                                        # single tap: Shift for the next letter
-                self.shift_once = not self.shift_once
-                self.last_start_tap = now
+        if pressed("c0") or pressed("start"):            # C-up or Start: Shift / Caps Lock
+            self.shift_press(now)
+
+    def shift_press(self, now):
+        """One press: Shift for the next letter. Double press: Caps Lock. While Caps Lock is on,
+        a single or double press turns it off."""
+        if self.caps:
+            self.caps, self.shift_once = False, False
+            self.caps_off_at = now
+            self.last_start_tap = 0.0
+        elif now - self.caps_off_at < 0.40:              # second press of a double press: stay off
+            self.caps_off_at = 0.0
+        elif now - self.last_start_tap < 0.40:           # double press: Caps Lock
+            self.caps, self.shift_once = True, False
+            self.last_start_tap = 0.0
+        else:                                            # single press: Shift for the next letter
+            self.shift_once = not self.shift_once
+            self.last_start_tap = now
 
     # ----- overlay state
     def overlay_state(self, now):
@@ -631,6 +729,7 @@ class App:
             layer, active, center = "letters", False, home_index(LISTS["letters"])
         return {
             "layer": layer,
+            "layer_dir": self.layer_dir,
             "active": active,
             "center": center,
             "upper": self.shift_once != self.caps,
@@ -685,6 +784,16 @@ user32.GetDC.argtypes = [wintypes.HWND]
 user32.UpdateLayeredWindow.argtypes = [wintypes.HWND, wintypes.HDC, ctypes.POINTER(wintypes.POINT),
                                        ctypes.POINTER(wintypes.SIZE), wintypes.HDC, ctypes.POINTER(wintypes.POINT),
                                        wintypes.COLORREF, ctypes.POINTER(BLENDFUNCTION), wintypes.DWORD]
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                ("dwFlags", wintypes.DWORD)]
+
+
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.MonitorFromPoint.restype = ctypes.c_void_p
+user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+MONITOR_DEFAULTTONEAREST = 2
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 gdi32.CreateDIBSection.restype = wintypes.HBITMAP
@@ -702,6 +811,15 @@ COLORS = {
 ARC_SOLID_DEG = 22.0     # the arc is fully visible within this many degrees of the top...
 ARC_FADE_DEG = 48.0      # ...and fades out by here (about the top quarter of the circle)
 STEP_DEG = 9.5           # spacing between characters on the arc
+SLIDE_DISTANCE = 0.85    # how far apart the two wheels are while sliding (in window widths)
+SLIDE_SECONDS = 0.30
+# Following the mouse: where the arc sits (degrees clockwise from the top) for the pointer near
+# each part of the screen. It faces away from nearby edges.
+FOLLOW_ANGLES = {
+    ("top", "left"): 135, ("top", "mid"): 180, ("top", "right"): 225,
+    ("mid", "left"): 90, ("mid", "mid"): 0, ("mid", "right"): 270,
+    ("bottom", "left"): 45, ("bottom", "mid"): 0, ("bottom", "right"): 315,
+}     # changing wheels: the old one slides off sideways, the new one slides in
 
 
 def arc_alpha(deg):
@@ -747,46 +865,99 @@ class Overlay:
         self.last_topmost = 0.0
         self.pos = 0.0          # where the characters are drawn (animates toward the selected index)
         self.anim = None        # (start pos, distance, start time, duration) while sliding or spinning
+        self.slide = None       # (old layer, old pos, direction, start time) while changing wheels
         self.last_tick = time.monotonic()
 
     def setup_size(self, scale):
-        """Size and place the wheel for a scale (the overlay_scale setting); can be called again to resize."""
+        """Size the wheel for a scale (the overlay_scale setting); can be called again to resize."""
         self.scale = scale
         self.k = k = self.dpi_scale * scale
         self.R = 230 * k                       # radius of the arc the characters ride on
         self.band = 46 * k                     # thickness of the arc
-        self.top = 34 * k                      # from the window top to the arc's center line at the top
-        self.w = int(2 * (self.R + self.band) * math.sin(math.radians(ARC_FADE_DEG)) + 40 * k)
-        self.h = int(self.R * (1 - math.cos(math.radians(ARC_FADE_DEG))) + self.top + self.band + 40 * k)
-        work = wintypes.RECT()
-        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA
-        self.x = work.left + (work.right - work.left - self.w) // 2
-        self.y = work.bottom - self.h - int(24 * k)
-        self.root.geometry(f"{self.w}x{self.h}+{self.x}+{self.y}")
+        # distances from the circle's center, along the line through the middle of the arc
+        self.d_label = self.R - self.band / 2 - 22 * k     # the wheel's name (abc / 123 / #+=)
+        self.d_mark = self.d_label - 27 * k                # Shift / CAPS / the last typed character
+        self.d_toast = self.d_label - 101 * k              # mode messages
+        self.d_pointer = self.d_label - 46 * k             # the mouse pointer, when the wheel follows it
 
-        # a 32-bit bitmap the frames are copied into, then handed to the window
-        bmi = BITMAPINFO()
-        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-        bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight = self.w, -self.h   # top-down
-        bmi.bmiHeader.biPlanes, bmi.bmiHeader.biBitCount = 1, 32
-        bits = ctypes.c_void_p()
-        hbmp = gdi32.CreateDIBSection(self.mem_dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
-        gdi32.SelectObject(self.mem_dc, hbmp)
-        if self.hbmp:
-            gdi32.DeleteObject(self.hbmp)
-        self.hbmp, self.bits = hbmp, bits
-
-        # load every font size and draw the arc now, so the first animation isn't slow
-        self.fonts, self.bases = {}, {}
+        # load every font size now, so the first animation isn't slow
+        self.fonts, self.bases, self.geoms = {}, {}, {}
         for size in range(int(8 * k), int(32 * k) + 2):
             try:
                 self.fonts[size] = ImageFont.truetype(FONT_PATH, size)
             except OSError:
                 break
+        self.theta, self.dib_size = None, None
+        self.set_geometry(0)
+        work = wintypes.RECT()
+        user32.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA
+        self.home = (work.left + (work.right - work.left - self.w) // 2, work.bottom - self.h - int(24 * k))
+        self.x, self.y = self.home             # where the wheel sits unless it follows the mouse
+        self.root.geometry(f"{self.w}x{self.h}+{self.x}+{self.y}")
         self.base(True)
         self.base(False)
-        self.blank = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
         self.last_state = None                 # redraw at the new size
+
+    # ----- where the arc sits: theta = the middle of the arc, in degrees clockwise from the top
+    def geometry(self, theta):
+        """The window size for an arc centered at theta, and where the circle's center is in it."""
+        g = self.geoms.get(theta)
+        if g is not None:
+            return g
+        k, t = self.k, math.radians(theta)
+        ux, uy = math.sin(t), -math.cos(t)
+        pts = []
+        for i in range(-24, 25):                         # the band's edges, every 2 degrees
+            a = t + math.radians(i * ARC_FADE_DEG / 24)
+            for r in (self.R - self.band / 2, self.R + self.band / 2):
+                pts.append((r * math.sin(a), -r * math.cos(a)))
+
+        def box(d, hw, hh):
+            pts.extend([(d * ux - hw, d * uy - hh), (d * ux + hw, d * uy + hh)])
+        box(self.R, 26 * k, 26 * k)                      # the highlight
+        box(self.d_label, 30 * k, 12 * k)
+        box(self.d_mark, 24 * k, 18 * k)
+        box(self.d_toast, 110 * k, 22 * k)
+        m = 6 * k
+        minx, maxx = min(p[0] for p in pts) - m, max(p[0] for p in pts) + m
+        miny, maxy = min(p[1] for p in pts) - m, max(p[1] for p in pts) + m
+        w, h = int(math.ceil(maxx - minx)), int(math.ceil(maxy - miny))
+        # sliding wheels fade out over the outer part of the window instead of being cut off at its edge
+        fade = max(1, int(w * 0.18))
+        ramp = Image.linear_gradient("L").rotate(90, expand=True).resize((fade, 1))   # 0 -> 255
+        mask = Image.new("L", (w, 1), 255)
+        mask.paste(ramp, (0, 0))
+        mask.paste(ramp.transpose(Image.FLIP_LEFT_RIGHT), (w - fade, 0))
+        g = {"w": w, "h": h, "cx": -minx, "cy": -miny, "edge_mask": mask.resize((w, h)),
+             "blank": Image.new("RGBA", (w, h), (0, 0, 0, 0))}
+        self.geoms[theta] = g
+        return g
+
+    def set_geometry(self, theta):
+        if theta == self.theta:
+            return
+        g = self.geometry(theta)
+        self.theta = theta
+        self.ux, self.uy = math.sin(math.radians(theta)), -math.cos(math.radians(theta))
+        self.w, self.h, self.cx, self.cy = g["w"], g["h"], g["cx"], g["cy"]
+        self.edge_mask, self.blank = g["edge_mask"], g["blank"]
+        if self.dib_size != (self.w, self.h):
+            # a 32-bit bitmap the frames are copied into, then handed to the window
+            bmi = BITMAPINFO()
+            bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+            bmi.bmiHeader.biWidth, bmi.bmiHeader.biHeight = self.w, -self.h   # top-down
+            bmi.bmiHeader.biPlanes, bmi.bmiHeader.biBitCount = 1, 32
+            bits = ctypes.c_void_p()
+            hbmp = gdi32.CreateDIBSection(self.mem_dc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+            gdi32.SelectObject(self.mem_dc, hbmp)
+            if self.hbmp:
+                gdi32.DeleteObject(self.hbmp)
+            self.hbmp, self.bits, self.dib_size = hbmp, bits, (self.w, self.h)
+        self.last_state = None
+
+    def point(self, d):
+        """The spot d from the circle's center, toward the middle of the arc."""
+        return self.cx + d * self.ux, self.cy + d * self.uy
 
     # ----- drawing helpers
     def font(self, px):
@@ -820,17 +991,64 @@ class Overlay:
         d.line([(xc - r, y - r), (xc + r, y + r)], fill=fill, width=lw)
         d.line([(xc - r, y + r), (xc + r, y - r)], fill=fill, width=lw)
 
+    def shift_mark(self, d, x, y, size, fill):
+        """A drawn Shift symbol: an outlined up arrow."""
+        px = size * self.k
+        hw, sw, h = px * 0.42, px * 0.18, px * 0.5        # head half-width, stem half-width, half-height
+        lw = max(2, int(px * 0.09))
+        top, mid, bot = y - h, y, y + h
+        d.line([(x, top), (x + hw, mid), (x + sw, mid), (x + sw, bot), (x - sw, bot), (x - sw, mid),
+                (x - hw, mid), (x, top)], fill=fill, width=lw, joint="curve")
+
+    def near_cursor(self):
+        """Where to put the wheel next to the mouse pointer, as (x, y, theta). The pointer sits just
+        inside the arc, past the wheel's label and Shift mark. Away from the screen's edges the arc is
+        above the pointer; near an edge or a corner it turns to face away from it (top-left corner:
+        the arc's bottom-right part, top edge: its bottom, and so on)."""
+        pt = wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(pt)):
+            return self.home + (0,)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(user32.MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), ctypes.byref(mi)):
+            return self.home + (0,)
+        wa, k = mi.rcWork, self.k
+        reach = self.R + self.band / 2 - self.d_pointer + 6 * k     # from the pointer out to the arc
+        side = self.geometry(0)["w"] / 2                             # half the arc's width
+        row = "top" if pt.y - wa.top < reach else "bottom" if wa.bottom - pt.y < reach else "mid"
+        col = "left" if pt.x - wa.left < side else "right" if wa.right - pt.x < side else "mid"
+        theta = FOLLOW_ANGLES[(row, col)]
+        g = self.geometry(theta)
+        t = math.radians(theta)
+        ux, uy = math.sin(t), -math.cos(t)
+        # room for the pointer's arrow, which hangs down and to the right of where it points
+        d = self.d_pointer - 26 * k * max(0.0, uy) - 14 * k * max(0.0, ux)
+        # the window's far side (empty, past the pointer) may hang off the screen; that's fine
+        x = int(round(pt.x - d * ux - g["cx"]))
+        y = int(round(pt.y - d * uy - g["cy"]))
+        return x, y, theta
+
     def arc_center(self):
-        return self.w / 2, self.top + self.R
+        return self.cx, self.cy
 
     def base(self, highlight):
-        """The faded arc (and the highlight at the top), drawn once at 3x and scaled down for smooth edges."""
-        img = self.bases.get(highlight)
+        """The faded arc (and the highlight in its middle), drawn once at 3x and scaled down for smooth edges."""
+        key = (self.theta, highlight)
+        img = self.bases.get(key)
         if img is not None:
+            return img
+        if self.theta != 0 and (0, highlight) in self.bases:
+            # the arc at the top, turned around the circle's center (much faster than drawing it)
+            g0, t = self.geometry(0), math.radians(self.theta)
+            c, sn, cx, cy = math.cos(t), math.sin(t), self.cx, self.cy
+            data = (c, sn, -c * cx - sn * cy + g0["cx"], -sn, c, sn * cx - c * cy + g0["cy"])
+            img = self.bases[(0, highlight)].transform((self.w, self.h), Image.AFFINE, data,
+                                                       resample=Image.BICUBIC)
+            self.bases[key] = img
             return img
         s = 3
         W, H = self.w * s, self.h * s
-        cx, cy = self.w / 2 * s, (self.top + self.R) * s
+        cx, cy = self.cx * s, self.cy * s
         R_out, R_in = (self.R + self.band / 2) * s, (self.R - self.band / 2) * s
         big = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         d = ImageDraw.Draw(big)
@@ -840,16 +1058,17 @@ class Overlay:
             a = arc_alpha(deg + 0.25)
             if a > 0:
                 # PIL angles: 0 = 3 o'clock, clockwise; the top is -90
-                d.pieslice((cx - R_out, cy - R_out, cx + R_out, cy + R_out), -90 + deg, -90 + deg + 0.6,
+                start = -90 + self.theta + deg
+                d.pieslice((cx - R_out, cy - R_out, cx + R_out, cy + R_out), start, start + 0.6,
                            fill=COLORS["panel"] + (int(235 * a),))
             deg += 0.5
         d.ellipse((cx - R_in, cy - R_in, cx + R_in, cy + R_in), fill=(0, 0, 0, 0))
         if highlight:
             r = 25 * self.k * s
-            tx, ty = cx, cy - self.R * s
+            tx, ty = cx + self.R * self.ux * s, cy + self.R * self.uy * s
             d.ellipse((tx - r, ty - r, tx + r, ty + r), fill=COLORS["accent"] + (255,))
         img = big.resize((self.w, self.h), Image.LANCZOS)
-        self.bases[highlight] = img
+        self.bases[key] = img
         return img
 
     def push(self, img):
@@ -874,12 +1093,28 @@ class Overlay:
         st = self.app.overlay_state(now)
         dt, self.last_tick = now - self.last_tick, now
         prev = self.last_state
+        was_typing, typing = bool(prev and prev["layer"]), bool(st["layer"])
+        if typing and not was_typing:                  # the wheel appears: next to the pointer, maybe
+            follow = self.app.settings.get("wheel_follows_mouse", False)
+            x, y, theta = self.near_cursor() if follow else self.home + (0,)
+            self.set_geometry(theta)
+            self.x, self.y = x, y
+        elif was_typing and not typing:                # mode messages show in the usual place
+            self.set_geometry(0)
+            self.x, self.y = self.home
         animating = False
         if st["layer"]:
             n = len(LISTS[st["layer"]])
             target = st["center"]
             if prev is None or prev["layer"] != st["layer"]:
-                self.pos, self.anim = float(target), None          # new wheel: no animation
+                if prev and prev["layer"] and st["layer_dir"]:
+                    # changed wheels with C-left / C-right. Inverted: the new one slides in from that
+                    # side; normal: the old one slides off that way
+                    flip = -1 if self.app.settings.get("invert_wheel", True) else 1
+                    self.slide = (prev["layer"], self.pos, flip * st["layer_dir"], now)
+                else:
+                    self.slide = None
+                self.pos, self.anim = float(target), None
             elif target != prev["center"] or st["active"] != prev["active"]:
                 # a step (quick slide), or the stick let go (spin back to the space)
                 delta = (target - self.pos + n / 2) % n - n / 2   # shortest way round (the list wraps)
@@ -894,6 +1129,12 @@ class Overlay:
                 animating = True
                 if u >= 1.0:
                     self.pos, self.anim = float(target), None
+            if self.slide:
+                if now - self.slide[3] >= SLIDE_SECONDS:
+                    self.slide = None
+                animating = True                                  # one more frame after it ends
+        else:
+            self.slide = None
         show = bool(st["layer"] or st["toast"])
         if st != prev or animating:
             self.last_state = st
@@ -911,28 +1152,81 @@ class Overlay:
             d = ImageDraw.Draw(img)
             f = self.font(16)
             tw = d.textlength(st["toast"], font=f)
-            ty, r = self.h - 40 * k, 20 * k
-            d.rounded_rectangle((cx - tw / 2 - r, ty - r, cx + tw / 2 + r, ty + r), radius=r,
+            tx, ty = self.point(self.d_toast)
+            r = 20 * k
+            d.rounded_rectangle((tx - tw / 2 - r, ty - r, tx + tw / 2 + r, ty + r), radius=r,
                                 fill=COLORS["toast"] + (240,))
-            d.text((cx, ty), st["toast"], font=f, fill=COLORS["text"] + (255,), anchor="mm")
+            d.text((tx, ty), st["toast"], font=f, fill=COLORS["text"] + (255,), anchor="mm")
             return img
 
-        chars = LISTS[layer]
-        n = len(chars)
         upper, active = st["upper"], st["active"]
-        img = self.base(active).copy()
+        if self.slide:
+            # the old wheel slides sideways toward the C button pressed, and the new one slides in
+            # behind it from the other side, so the two move together like cards
+            old_layer, old_pos, direction, t0 = self.slide
+            u = min(1.0, (time.monotonic() - t0) / SLIDE_SECONDS)
+            e = 1.0 - (1.0 - u) ** 3                           # fast start, eases into place
+            dist = SLIDE_DISTANCE * self.w
+            dx = int(round(direction * e * dist))
+            img = self.blank.copy()
+            self.paste_shifted(img, self.wheel(old_layer, old_pos, False, upper), dx)
+            self.paste_shifted(img, self.wheel(layer, self.pos, active, upper),
+                               int(round(dx - direction * dist)))
+            a = ImageChops.multiply(img.getchannel("A"), self.edge_mask)   # fade out at the window's sides
+            img.putalpha(a)
+        else:
+            img = self.wheel(layer, self.pos, active, upper)
+
+        # under the wheel's label (these stay put while wheels slide): Shift / Caps, the last
+        # typed character, mode messages
+        top_img = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
+        d = ImageDraw.Draw(top_img)
+        mx, my = self.point(self.d_mark)
+        if st["flash"] == "␣":
+            self.space_mark(d, mx, my, 22, COLORS["accent"] + (255,))
+        elif st["flash"]:
+            d.text((mx, my), st["flash"], font=self.font(22), fill=COLORS["accent"] + (255,), anchor="mm")
+        elif st["caps"]:
+            d.text((mx, my), "CAPS", font=self.font(14), fill=COLORS["accent"] + (255,), anchor="mm")
+        elif upper:
+            self.shift_mark(d, mx, my, 18, COLORS["accent"] + (255,))
+        if st["toast"]:
+            d.text(self.point(self.d_toast), st["toast"], font=self.font(12), fill=COLORS["text"] + (230,), anchor="mm")
+        return Image.alpha_composite(img, top_img)
+
+    def wheel(self, layer, pos, active, upper):
+        """One whole wheel: the arc, its characters around pos, and its label (abc / 123 / #+=)."""
         layer_img = Image.new("RGBA", (self.w, self.h), (0, 0, 0, 0))
         d = ImageDraw.Draw(layer_img)
-        pos = self.pos % n
+        self.draw_chars(d, LISTS[layer], pos, upper, active)
+        d.text(self.point(self.d_label), LAYER_LABEL[layer], font=self.font(13), fill=COLORS["dim"] + (230,), anchor="mm")
+        return Image.alpha_composite(self.base(active), layer_img)
+
+    @staticmethod
+    def paste_shifted(dst, src, dx):
+        """Composite src onto dst moved dx pixels sideways (the part that falls outside is dropped)."""
+        w = src.width
+        if abs(dx) >= w:
+            return
+        if dx >= 0:
+            dst.alpha_composite(src.crop((0, 0, w - dx, src.height)), (dx, 0))
+        else:
+            dst.alpha_composite(src.crop((-dx, 0, w, src.height)), (0, 0))
+
+    def draw_chars(self, d, chars, pos, upper, active):
+        """One wheel's characters around pos."""
+        cx, cy = self.arc_center()
+        n = len(chars)
+        pos = pos % n
         base = math.floor(pos)
         for i in range(base - 6, base + 7):
-            off = i - pos                                      # characters after the selection sit right
+            off = i - pos                  # characters after the selection sit clockwise from it
             deg = off * STEP_DEG
             a = arc_alpha(deg)
             if a <= 0.02:
                 continue
             dist = abs(off)
-            ang = math.radians(deg)
+            ang = math.radians(self.theta + deg)       # characters stay upright wherever the arc is
             x, y = cx + self.R * math.sin(ang), cy - self.R * math.cos(ang)
             size = 30 - 10 * min(dist, 1) - 1.5 * min(max(dist - 1, 0), 3)
             if not active:
@@ -955,19 +1249,6 @@ class Overlay:
                 ch = ch.upper()
             d.text((x, y), ch, font=self.font(size), fill=fill, anchor="mm")
 
-        # under the top of the arc: layer, Shift / Caps, the last typed character, mode messages
-        below = self.top + self.band / 2 + 22 * k
-        d.text((cx, below), LAYER_LABEL[layer], font=self.font(13), fill=COLORS["dim"] + (230,), anchor="mm")
-        shift = "CAPS" if st["caps"] else ("\u21e7" if upper else "")
-        if st["flash"] == "␣":
-            self.space_mark(d, cx, below + 28 * k, 22, COLORS["accent"] + (255,))
-        elif st["flash"]:
-            d.text((cx, below + 28 * k), st["flash"], font=self.font(22), fill=COLORS["accent"] + (255,), anchor="mm")
-        elif shift:
-            d.text((cx, below + 26 * k), shift, font=self.font(14), fill=COLORS["accent"] + (255,), anchor="mm")
-        if st["toast"]:
-            d.text((cx, self.h - 16 * k), st["toast"], font=self.font(12), fill=COLORS["text"] + (230,), anchor="mm")
-        return Image.alpha_composite(img, layer_img)
 
 
 # ---------------------------------------------------------------- entry
